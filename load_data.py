@@ -54,10 +54,12 @@ def tokenized_dataset(dataset, tokenizer):
 from pororo import Pororo
 def TEM_tokenized_dataset(dataset, tokenizer):
   ner = Pororo(task = 'ner', lang = 'ko')
-  TEM_preprocess_sent = []
+  TEM_preprocess_sent, concat_entity = [], []
 
   print('----Start TEM_token_processeing----')
   start_time = time.time() # 시작 시간 기록
+
+  sep = tokenizer.special_tokens_map["sep_token"]
   for sent, ent1, ent2, start1, end1, start2, end2 in zip(dataset['sentence'], dataset['entity_01'], dataset['entity_02'],
                                                           dataset['entity_01_start'], dataset['entity_01_end'],
                                                           dataset['entity_02_start'], dataset['entity_02_end']):
@@ -69,16 +71,17 @@ def TEM_tokenized_dataset(dataset, tokenizer):
     entity_02_start, entity_02_end = int(start2), int(end2)
 
     if entity_01_start < entity_02_start:
-      sent = sent[:entity_01_start]+"[S_ENT1]"+ner_01+sent[entity_01_start:entity_01_end+1]+"[E_ENT1]"+sent[entity_01_end+1:entity_02_start]+\
-             "[S_ENT2]"+ner_02+sent[entity_02_start:entity_02_end+1]+"[E_ENT2]"+sent[entity_02_end+1:]
+      sent = sent[:entity_01_start] + "[S_ENT1]" + ner_01 + ent1 +"[E_ENT1]" + sent[entity_01_end+1:entity_02_start]+\
+             "[S_ENT2]" + ner_02 + ent2 + "[E_ENT2]" + sent[entity_02_end+1:]
     else:
       sent = sent[:entity_02_start]+"[S_ENT2]"+ner_02+sent[entity_02_start:entity_02_end+1]+"[E_ENT2]"+sent[entity_02_end+1:entity_01_start]+\
              "[S_ENT1]"+ner_01+sent[entity_01_start:entity_01_end+1]+"[E_ENT1]"+sent[entity_01_end+1:]
 
+    concat_entity.append("[S_ENT1]" + ner_01 + ent1 + "[E_ENT1]" + sep + "[S_ENT2]" + ner_02 + ent2 + "[E_ENT2]") 
     TEM_preprocess_sent.append(sent)
 
-  sep = tokenizer.special_tokens_map["sep_token"]
-  concat_entity = list("[S_ENT1]" + dataset['entity_01'] + "[E_ENT1]" + sep + "[S_ENT2]" + dataset['entity_02'] + "[E_ENT2]")
+  #sep = tokenizer.special_tokens_map["sep_token"]
+  #concat_entity = list("[S_ENT1]" + dataset['entity_01'] + "[E_ENT1]" + sep + "[S_ENT2]" + dataset['entity_02'] + "[E_ENT2]")
 
   tokenized_sentences = tokenizer(
       concat_entity,

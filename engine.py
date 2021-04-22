@@ -1,8 +1,6 @@
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from transformers import AutoTokenizer, Trainer, TrainingArguments, AutoModelForSequenceClassification, AutoConfig, AdamW, get_scheduler
-from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau, CyclicLR
-
-from transformers import RobertaForSequenceClassification
+from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau, CosineAnnealingWarmRestarts
 
 from load_data import *
 from trainer import Trainer
@@ -17,52 +15,85 @@ def engine(cfg, args):
     tokenizer.add_special_tokens({"additional_special_tokens": ["[S_ENT1]", "[E_ENT1]", "[S_ENT2]", "[E_ENT2]", 
                                                                 "[S_NER1]", "[E_NER1]", "[S_NER2]", "[E_NER2]"]})
     
-    ### 모델 정의
+    ########## 모델 정의
     config = AutoConfig.from_pretrained(cfg.values.model_name, num_labels = 42)
     model = AutoModelForSequenceClassification.from_pretrained(cfg.values.model_name, config = config)
     model.resize_token_embeddings(len(tokenizer))
-    
+
+    ####### dataset 정의
     if args.mode == 'train':
         dataset = load_train_data("/opt/ml/input/data/train/train_c.tsv")
         train_df, val_df = train_test_split(dataset, test_size = cfg.values.val_args.test_size, random_state = cfg.values.seed)
-
         # tokenizing
         tokenized_train = TEM_tokenized_dataset(train_df, tokenizer)
         tokenized_val = TEM_tokenized_dataset(val_df, tokenizer)
 
         train_dataset = RE_Dataset(tokenized_train, labels = train_df['label'].values)
         val_dataset = RE_Dataset(tokenized_val, labels = val_df['label'].values)
+    elif args.mode == 'inference':
+        ### load my model
+        model.load_state_dict(torch.load(f"/opt/ml/my_code/results/{args.config}.pt"))
+        # load test datset
+        test_dataset, test_label = load_test_dataset("/opt/ml/input/data/test/test.tsv", tokenizer)
+        test_dataset = RE_Dataset(test_dataset, test_label)
+    else:
+        dataset = load_train_data("/opt/ml/input/data/train/train_c.tsv")
+        # tokenizing
+        tokenized_train = TEM_tokenized_dataset(dataset, tokenizer)
+        train_dataset = RE_Dataset(tokenized_train, labels = dataset['label'].values)
 
-        ### optimizer, scheduler 정의
-        # applying weight decay to all parameters other than bias and layer normalization terms
-        no_decay = ['bias', 'LayerNorm.weight']
-        optimizer_grouped_parameters = [
-            {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': cfg.values.train_args.weight_decay},
-            {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-        ]
-        optimizer = AdamW(
-            optimizer_grouped_parameters,
-            lr=cfg.values.train_args.lr,
-            eps=cfg.values.train_args.adam_epsilon,
+    ########## optimizer, scheduler 정의
+    # applying weight decay to all parameters other than bias and layer normalization terms
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': cfg.values.train_args.weight_decay},
+        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    ]
+    optimizer = AdamW(
+        optimizer_grouped_parameters,
+        lr=cfg.values.train_args.lr,
+        eps=cfg.values.train_args.adam_epsilon,
+        )
+
+    if cfg.values.train_args.scheduler_name == 'steplr':
+        scheduler = StepLR(
+            optimizer, 
+            step_size = (train_dataset.__len__() // cfg.values.train_args.train_batch_size) * cfg.values.train_args.warmup_epoch, 
+            gamma = cfg.values.train_args.steplr_gamma
             )
 
-        if cfg.values.train_args.scheduler_name == 'steplr':
-            scheduler = StepLR(
-                optimizer, 
-                step_size = (train_dataset.__len__() // cfg.values.train_args.train_batch_size) * cfg.values.train_args.warmup_epoch, 
-                gamma = cfg.values.train_args.steplr_gamma
-                )
+    elif cfg.values.train_args.scheduler_name == 'ReduceLROnPlateau':
+        scheduler = ReduceLROnPlateau(optimizer, 'max', factor = cfg.values.train_args.steplr_gamma, patience = 3, cooldown = 0)
+    
+    elif cfg.values.train_args.scheduler_name == 'cosine' :
+        scheduler = CosineAnnealingLR(
+                        optimizer, 
+                        T_max = int((train_dataset.__len__() // cfg.values.train_args.train_batch_size) * cfg.values.train_args.warmup_epoch),
+                        eta_min = 0.000005
+                        )
 
-        elif cfg.values.train_args.scheduler_name == 'ReduceLROnPlateau':
-            scheduler = ReduceLROnPlateau(optimizer, 'max', factor = cfg.values.train_args.steplr_gamma, patience = 2, cooldown = 0)
+    elif cfg.values.train_args.scheduler_name == 'CosineAnnealing' :
+        # scheduler = CosineAnnealingWarmRestarts(optimizer, 
+        #             T_0=int((train_dataset.__len__() // cfg.values.train_args.train_batch_size) * cfg.values.train_args.warmup_epoch), 
+        #             T_mult=1, 
+        #             eta_min=0.000005)
 
-        else:
-            scheduler = get_scheduler(
-                cfg.values.train_args.scheduler_name, optimizer, 
-                num_warmup_steps = (train_dataset.__len__() // cfg.values.train_args.train_batch_size) * cfg.values.train_args.warmup_epoch, 
-                num_training_steps = train_dataset.__len__() * cfg.values.train_args.num_epochs
-                )
+        scheduler = CosineAnnealingWarmupRestarts(optimizer,
+                        first_cycle_steps=int((train_dataset.__len__() // cfg.values.train_args.train_batch_size) * 8),
+                        cycle_mult=1.0,
+                        max_lr=cfg.values.train_args.lr,
+                        min_lr=0.000007,
+                        warmup_steps=int((train_dataset.__len__() // cfg.values.train_args.train_batch_size) * cfg.values.train_args.warmup_epoch),
+                        gamma=1.0)
 
+    else:
+        scheduler = get_scheduler(
+            cfg.values.train_args.scheduler_name, optimizer, 
+            num_warmup_steps = int((train_dataset.__len__() // cfg.values.train_args.train_batch_size) * cfg.values.train_args.warmup_epoch),
+            num_training_steps = train_dataset.__len__() * cfg.values.train_args.num_epochs
+            )
+
+    if args.mode == 'train':
         best_valid_loss = float('inf')
         best_valid_acc, best_model_saved_epoch = 0, 1
         for epoch in range(cfg.values.train_args.num_epochs):
@@ -97,12 +128,6 @@ def engine(cfg, args):
         print('='*50 + ' Training finished ' + '='*50)
 
     elif args.mode == 'inference':
-        ### load my model
-        model.load_state_dict(torch.load(f"/opt/ml/my_code/results/{args.config}.pt"))
-        # load test datset
-        test_dataset, test_label = load_test_dataset("/opt/ml/input/data/test/test.tsv", tokenizer)
-        test_dataset = RE_Dataset(test_dataset, test_label)
-
         trainer = Trainer(cfg, model, test_dataset = test_dataset)
         pred_answer = trainer.evaluate(args.mode)
 
@@ -110,6 +135,28 @@ def engine(cfg, args):
         output.to_csv(f'/opt/ml/my_code/results/{args.config}_submission.csv', index=False)
         print()
         print('='*50 + ' Inference finished ' + '='*50)
+
+    elif args.mode == 'final_train':
+        for epoch in range(cfg.values.train_args.num_epochs):
+            start_time = time.time() # 시작 시간 기록
+
+            trainer = Trainer(cfg, model, epoch, optimizer, scheduler, train_dataset)
+            train_loss, train_acc = trainer.train()
+
+            end_time = time.time() # 종료 시간 기록
+            elapsed_time = end_time - start_time
+            elapsed_mins = int(elapsed_time / 60)
+            elapsed_secs = int(elapsed_time - (elapsed_mins * 60))
+
+            print(f'Time Spent : {elapsed_mins}m {elapsed_secs}s')
+            print(f'\tTrain Loss: {train_loss:.3f} | Train Acc: {round(train_acc*100, 2)}%')
+            current_lr = get_lr(optimizer)
+            torch.save(model.state_dict(), f'/opt/ml/my_code/results/final_{args.config}.pt')
+        print()
+        print('='*50 + ' Final Training finished ' + '='*50)
+
+
+
 
 
 
