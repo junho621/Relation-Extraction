@@ -7,6 +7,6 @@
 * python main.py --mode=inference
 
 ### final_train
-## training the model with the whole dataset (including validation set)
+#### training the model with the whole dataset (including validation set)
 * python main.py --mode=final_train
 # Relation-Extraction
